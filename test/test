@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+
+# Test suite for grab. Portable across bash, dash, zsh, and busybox sh.
+#
+# Tests are stateful and must run in the order listed: earlier tests move files
+# out of the sandbox that later tests depend on finding there.
+
+set -eu
+
+# pipefail is not POSIX. The subshell absorbs the error if the shell doesn't
+# support it so that `set -o pipefail` in the outer shell is never reached on
+# those shells, keeping set -e from firing.
+(set -o pipefail) 2>/dev/null && set -o pipefail
+
+# --- Color palette
+
+# One subshell captures the ESC byte; every color is then a plain string
+# concatenation. Variables hold actual ESC bytes so they can be passed as %s
+# arguments rather than embedded in format strings (SC2059).
+ESC=$(printf '\033')
+CYAN="${ESC}[1;36m"
+MAGENTA="${ESC}[1;35m"
+YELLOW="${ESC}[1;33m"
+GREEN="${ESC}[1;32m"
+RED="${ESC}[1;31m"
+RESET="${ESC}[0m"
+
+OK="${GREEN}✔${RESET}"
+FAIL="${RED}✘${RESET}"
+ARROW="${MAGENTA}→${RESET}"
+SECTION="${CYAN}▌${RESET}"
+
+# --- Resolve repo root
+
+# Derive the path from the script's own location so the suite works regardless
+# of the caller's working directory.
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+GRAB="$ROOT/grab"
+
+# --- Helpers
+
+test_header() {
+    printf '\n%s\n' "${SECTION} ${CYAN}$1${RESET}"
+}
+
+# Run a named test function and print a pass/fail line. Exits the suite on the
+# first failure so the broken state is easy to diagnose.
+run_test() {
+    label="$1"; shift
+    printf '  %s %-40s' "$ARROW" "$label"
+    if "$@"; then
+        printf ' %s\n' "$OK"
+    else
+        printf ' %s\n' "$FAIL"
+        exit 1
+    fi
+}
+
+# --- Sandbox setup
+
+test_header "Initializing sandbox"
+
+sandbox="$(mktemp -d)"
+src="$sandbox/screens"
+mkdir -p "$src"
+
+# Distinct timestamps make sort order deterministic regardless of filesystem
+# clock resolution.
+touch -t 202605131853 "$src/screenshot-2026-05-13-18:53:16.png"
+touch -t 202605111039 "$src/screenshot-2026-05-11-10:39:17.png"
+touch -t 202605101200 "$src/screenshot-2026-05-10-12:00:00.png"
+
+printf '  %s\n' "${OK} Sandbox ready at ${YELLOW}${sandbox}${RESET}"
+
+cleanup() { rm -rf "$sandbox"; }
+trap cleanup EXIT INT TERM
+
+# --- Test functions
+#
+# Return 0 for pass, non-zero for fail. Use `return 1` for explicit failure.
+#
+# Use `return 1` rather than `false` for portability: under busybox sh and dash,
+# set -e stays active inside function bodies even when the function is called
+# from an `if` condition. `false` exits 1 and fires set -e, aborting the whole
+# script instead of handing control back to run_test. `return 1` exits just the
+# function cleanly.
+#
+# Inside ( ) subshells use `exit`, not `return` — `return` is only valid in a
+# function body.
+
+test_dry_run_latest() {
+    before=$(find "$src" -maxdepth 1 -type f | wc -l)
+    out="$("$GRAB" -n -s "$src")" || return 1
+    after=$(find "$src" -maxdepth 1 -type f | wc -l)
+    printf '%s\n' "$out" | grep -q 'screenshot-2026-05-13-18:53:16.png'
+    [ "$before" -eq "$after" ]
+}
+
+test_single_file_rename() {
+    # count=1 (default) with a name argument must produce name.png, not name-1.png.
+    # The -1 suffix only applies when count > 1.
+    out="$("$GRAB" -n -s "$src" myshot)" || return 1
+    printf '%s\n' "$out" | grep -q 'myshot\.png' || return 1
+    ! printf '%s\n' "$out" | grep -q 'myshot-1\.png'
+}
+
+test_rename_two_files() {
+    mkdir -p "$sandbox/rename"
+    # cd in a subshell so grab deposits files into the current directory by
+    # default, testing that default-target behavior without -t.
+    (
+        cd "$sandbox/rename" || exit 1
+        "$GRAB" -2 -s "$src" web >/dev/null || exit 1
+        [ -f web-1.png ] && [ -f web-2.png ]
+    ) || return 1
+}
+
+test_copy_keeps_originals() {
+    before=$(find "$src" -maxdepth 1 -type f | wc -l)
+    "$GRAB" -c -s "$src" -t "$sandbox" >/dev/null
+    after=$(find "$src" -maxdepth 1 -type f | wc -l)
+    [ "$before" -eq "$after" ]
+}
+
+test_target_directory() {
+    mkdir -p "$sandbox/target"
+    "$GRAB" -s "$src" -t "$sandbox/target" >/dev/null
+    [ "$(find "$sandbox/target" -maxdepth 1 -type f | wc -l)" -gt 0 ]
+}
+
+test_pattern_override() {
+    touch "$src/windowshot-foo.png"
+    out="$("$GRAB" -n -s "$src" -p 'windowshot-*.png')" || return 1
+    printf '%s\n' "$out" | grep -q 'windowshot-foo.png'
+}
+
+test_quiet_mode() {
+    # By this point all original screenshots have been moved out of $src, so
+    # create a fresh one for this test.
+    touch -t 202605091200 "$src/screenshot-2026-05-09-12:00:00.png"
+    out="$("$GRAB" -q -n -s "$src")" || return 1
+    [ -z "$out" ]
+}
+
+test_missing_source_error() {
+    # || true lets grab fail as expected without triggering set -e.
+    err="$("$GRAB" -s "$sandbox/does-not-exist" 2>&1 || true)"
+    printf '%s\n' "$err" | grep -q 'error:' || return 1
+
+    # Use `!` rather than `cmd && false` to assert non-zero exit. Under busybox
+    # sh and dash, set -e fires on `cmd && false` when cmd fails as intended,
+    # killing the script. POSIX guarantees set -e is never triggered on a
+    # `! pipeline`, so `!` returns failure to run_test without a hard abort.
+    ! "$GRAB" -s "$sandbox/does-not-exist" >/dev/null 2>&1
+}
+
+# --- Run tests
+
+test_header "Core functionality"
+run_test "dry-run detects latest screenshot"      test_dry_run_latest
+run_test "count=1 with name produces name.png"    test_single_file_rename
+run_test "rename produces name-1.png, name-2.png" test_rename_two_files
+run_test "copy mode leaves originals intact"      test_copy_keeps_originals
+run_test "target directory receives files"        test_target_directory
+
+test_header "Pattern + quiet mode"
+run_test "pattern override matches custom glob"   test_pattern_override
+run_test "quiet mode suppresses non-error output" test_quiet_mode
+
+test_header "Error handling"
+run_test "missing source directory triggers error" test_missing_source_error
+
+test_header "All tests passed"
+printf '%s\n' "  ${GREEN}All systems nominal.${RESET}"

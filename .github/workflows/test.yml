@@ -1,0 +1,40 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: Lint with ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: shellcheck grab test/test
+
+  test:
+    name: "Test with: ${{ matrix.shell }}"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shell:
+          - bash
+          - dash
+          - sh
+          - busybox sh
+          - zsh
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install shells
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zsh yash busybox
+
+      - name: Run test suite on ${{ matrix.shell }}
+        run: |
+          echo "Running tests under ${{ matrix.shell }}"
+          ${{ matrix.shell }} test/test

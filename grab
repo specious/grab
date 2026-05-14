@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+
+# grab — move or copy the latest N screenshots into a target directory.
+# Requires bash (for pipefail). Compatible with bash 3+, GNU find, and BSD find.
+
+set -eu
+
+# pipefail is not POSIX; probe in a subshell so unsupporting shells skip it.
+(set -o pipefail) 2>/dev/null && set -o pipefail
+
+VERSION="1.0.0"
+
+src_dir="${HOME}/Downloads/screenshots"
+pattern="screenshot-*.png"
+target_dir="."
+count=1
+name=""
+dry_run=0
+copy_mode=0
+quiet=0
+
+# --- Helpers
+
+_getval() {
+    # ${2-} expands to $2 if set, empty string if absent — safe under set -u.
+    # The second test rejects a value that starts with '-', which almost always
+    # means the caller forgot the value and the next flag was consumed instead.
+    if [ -z "${2-}" ] || [ "${2#-}" != "$2" ]; then
+        printf "error: %s requires a value\n" "$1" >&2
+        exit 1
+    fi
+    printf "%s" "$2"
+}
+
+usage() {
+    cat <<EOF
+grab $VERSION — grab the latest screenshots
+
+Usage:
+  grab [options] [name]
+
+Options:
+  -n, --dry-run          Show what would be done without moving/copying
+  -c, --copy             Copy instead of move
+  -q, --quiet            Suppress non-error output
+  -s, --source <dir>     Source directory (default: ~/Downloads/screenshots)
+  -p, --pattern <glob>   Filename pattern (default: screenshot-*.png)
+  -t, --target <dir>     Target directory (default: .)
+  -h, --help             Show this help and exit
+      --version          Show version and exit
+
+Examples:
+  grab               # move last screenshot into .
+  grab web           # rename last screenshot to web.png
+  grab -3 web        # rename last 3 screenshots to web-1.png, web-2.png...
+  grab -c -t ~/tmp   # copy last screenshot into ~/tmp
+EOF
+    exit 0
+}
+
+# --- Parse args
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n|--dry-run)
+            dry_run=1; shift ;;
+        -c|--copy)
+            copy_mode=1; shift ;;
+        -q|--quiet)
+            quiet=1; shift ;;
+        -s|--source)
+            src_dir="$(_getval --source "${2-}")"; shift 2 ;;
+        -p|--pattern)
+            pattern="$(_getval --pattern "${2-}")"; shift 2 ;;
+        -t|--target)
+            target_dir="$(_getval --target "${2-}")"; shift 2 ;;
+        --version)
+            printf "grab %s\n" "$VERSION"
+            exit 0 ;;
+        -h|--help)
+            usage ;;
+        -[0-9]*)
+            count="${1#-}"
+            case "$count" in
+                *[!0-9]*|0)
+                    printf "error: count must be a positive integer\n" >&2
+                    exit 1 ;;
+            esac
+            shift ;;
+        --)
+            shift; break ;;
+        -*)
+            printf "error: unknown option: %s\n" "$1" >&2
+            exit 1 ;;
+        *)
+            name="$1"; shift ;;
+    esac
+done
+
+# If -- ended the option list, the first remaining arg is the name.
+[ $# -gt 0 ] && name="$1"
+
+# --- Validate
+
+if ! [ -d "$src_dir" ]; then
+    printf "error: source directory not found: %s\n" "$src_dir" >&2
+    exit 1
+fi
+
+if ! [ -d "$target_dir" ]; then
+    printf "error: target directory not found: %s\n" "$target_dir" >&2
+    exit 1
+fi
+
+# --- Find matching files, sorted newest-first
+#
+# Probe for mtime support in order of preference:
+#   1. GNU/busybox find: -printf '%T@ %p\n'  (test on '.' which always exists)
+#   2. GNU/busybox stat: stat -c '%Y %n'
+#   3. BSD stat (macOS): stat -f '%m %N'
+# All branches emit "<mtime> <path>" lines that sort | awk trims to the top N
+# paths. awk reads all input before exiting, avoiding SIGPIPE to sort (which
+# head would cause under pipefail when there are more files than the count).
+
+_pick() { sort -nr | awk -v n="$count" 'NR<=n{sub(/^[^ ]+ /,"");print}'; }
+
+if find . -maxdepth 0 -printf '%T@\n' >/dev/null 2>&1; then
+    files=$(find "$src_dir" -maxdepth 1 -type f -name "$pattern" \
+        -printf '%T@ %p\n' | _pick)
+elif stat -c '%Y' . >/dev/null 2>&1; then
+    files=$(find "$src_dir" -maxdepth 1 -type f -name "$pattern" \
+        -exec stat -c '%Y %n' {} \; | _pick)
+else
+    files=$(find "$src_dir" -maxdepth 1 -type f -name "$pattern" \
+        -exec stat -f '%m %N' {} \; | _pick)
+fi
+
+if [ -z "$files" ]; then
+    printf "error: no matching files (%s) in %s\n" "$pattern" "$src_dir" >&2
+    exit 1
+fi
+
+# --- Move/copy logic
+
+# Unquoted $files intentionally word-splits on newlines to iterate paths.
+# This breaks for paths containing spaces, which is acceptable here.
+i=1
+for f in $files; do
+    base="${f##*/}"
+
+    if [ -n "$name" ]; then
+        if [ "$count" -eq 1 ]; then
+            new="${name}.png"
+        else
+            new="${name}-${i}.png"
+        fi
+    else
+        new="$base"
+    fi
+
+    dest="${target_dir%/}/$new"
+
+    if [ "$dry_run" -eq 1 ]; then
+        [ "$quiet" -eq 0 ] && printf "[dry-run] %s → %s\n" "$f" "$dest"
+    else
+        if [ "$copy_mode" -eq 1 ]; then
+            [ "$quiet" -eq 0 ] && printf "copying %s → %s\n" "$f" "$dest"
+            cp -- "$f" "$dest"
+        else
+            [ "$quiet" -eq 0 ] && printf "moving %s → %s\n" "$f" "$dest"
+            mv -- "$f" "$dest"
+        fi
+    fi
+
+    i=$((i+1))
+done
